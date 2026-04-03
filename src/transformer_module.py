@@ -59,13 +59,25 @@ class MultiHeadAttention(nn.Module):
         scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_k ** 0.5)  # [batch_size, num_heads, seq_len, seq_len]
         ## 因果掩码和 softmax 计算注意力权重
         Attention = F.softmax(scores + self.mask[..., :seq_len, :seq_len], dim=-1)  # [batch_size, num_heads, seq_len, seq_len]
+        self.captured_attention = Attention  # **新增**：捕获注意力矩阵，用hook记录下来，方便后续分析
         ## 乘以 Value 完成加权求和
         Out = torch.matmul(Attention, V)  # [batch_size, num_heads, seq_len, d_k]
         # 多头拼接并乘以输出矩阵(必须先内存连续化(contiguous)再view，否则会报错)
         Out = Out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)  # [batch_size, seq_len, d_model]
         H = self.W_O(Out)  # [batch_size, seq_len, d_model]
         return H
-    
+
+
+class AttentionProbe:
+    def __init__(self):
+        self.captured_data = []
+    def __call__(self, module, input, output):
+        attention = module.captured_attention.detach().cpu().numpy() 
+        self.captured_data.append(attention)
+    def reset(self):
+        self.captured_data = [] 
+
+
 class SwiGLU(nn.Module):
     def __init__(self,d_model,d_hidden):
         super().__init__()
