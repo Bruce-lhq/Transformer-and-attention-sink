@@ -110,7 +110,6 @@ class AttentionSinkExperiment:
                 cbar_kws={"shrink": .8}# 缩小一点颜色条，更美观
             )
             head_title = f"Head {head_idx}" if isinstance(head_idx, int) else "Mean of All Heads"
-            # 适应中文字体
             plt.rcParams['font.sans-serif'] = ['Songti SC']  # 设置中文字体为宋体
             plt.title(f"Attention Map (Layer {layer_idx}, {head_title})")
             plt.xlabel("Key")
@@ -127,6 +126,7 @@ class AttentionSinkExperiment:
             for _ in range(max_new_tokens):
                 output_logits = self.model(input_ids)  # [1, seq_len, vocab_size]
                 next_token_logits = output_logits[:, -1, :]  # [1, vocab_size]
+                next_token_logits[:,0] = float('-inf')  # 禁止生成 padding token
                 next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)  # [1, 1]
                 input_ids = torch.cat((input_ids, next_token_id), dim=1)  # 将新预测的 token id 添加到输入序列末尾
             generated_text = self.tokenizer.decode(input_ids.cpu())  # 解码成文本
