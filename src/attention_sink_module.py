@@ -3,8 +3,9 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import seaborn as sns
+from torch.utils.tensorboard import SummaryWriter
 class AttentionSinkExperiment:
-    def __init__(self, num_blocks, corpus=None, num_heads=8, d_model=512, max_seq_len=4096, learning_rate=3e-4, load_from=None):
+    def __init__(self, num_blocks, corpus=None, num_heads=8, d_model=512, max_seq_len=4096, learning_rate=3e-4, load_from=None, log_dir=None):
         if torch.backends.mps.is_available():
             self.device = torch.device("mps")
         elif torch.cuda.is_available():
@@ -52,6 +53,10 @@ class AttentionSinkExperiment:
             self.model.to(self.device)
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         self.criterion = nn.CrossEntropyLoss()  # 交叉熵损失函数
+        if log_dir is not None:
+            self.writer = SummaryWriter(log_dir=log_dir)
+        else:
+            self.writer = None
     
     def train(self, texts_for_train, batch_size=8, epochs=100, log_interval=10, save_path=None):
         self.model.train()
@@ -78,6 +83,7 @@ class AttentionSinkExperiment:
                 self.optimizer.step()
                 epoch_loss += loss.item() # 累加当前 batch 的损失
                 num_batches += 1
+                self.writer.add_scalar('Loss/train', loss.item(), epoch * (dataset_size // batch_size) + num_batches) if self.writer is not None else None
                 # 打印每个小批次的进度（可选）
                 if num_batches % 50 == 1:
                     print(f"  Step {num_batches} Loss: {loss.item():.4f}")
@@ -114,7 +120,6 @@ class AttentionSinkExperiment:
                         }
             torch.save(checkpoint, save_path)
             print(f"Model saved to {save_path}")
-                
 
 
     def visualize_attention(self, text_for_test, layer_idx=-1, head_idx='mean'):
