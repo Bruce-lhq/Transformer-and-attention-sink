@@ -215,7 +215,7 @@ class SimpleTokenizer:
     def encode(self, texts):
         if isinstance(texts, str):
             texts = [texts]
-        ids = [[0]+[self.char_to_id[char] for char in text] for text in texts] # 在每个文本的开头加一个<pad> token
+        ids = [[0]+[self.char_to_id[char] for char in text[:511] if char in self.char_to_id] for text in texts] # 在每个文本的开头加一个<pad> token，截断到512字符，跳过未知字符
         # 填充0使得所有序列长度相同，这样才能转化为tensor
         max_len = max(len(id_seq) for id_seq in ids)
         batch_size = len(ids)
@@ -251,16 +251,102 @@ class ToyModel(nn.Module):
         self.window_size = window_size
         self.embedding = nn.Embedding(vocab_size, d_model)  # 新增：词嵌入层，将离散的 token 转换为连续的向量表示
         # self.embedding的作用: 输入是离散的整数(代表离散的Token)，输出是连续的embedding向量(每个Token对应一个d_model维的向量)，这个映射是可学习的
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)  
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         # 新增：预测头，将 [batch_size, seq_len, d_model] 的 x 转换成 [batch_size, seq_len, vocab_size] 的 logits，表示每个位置上预测下一个 token 的未归一化的对数概率分布。
-    
+        self._layer_caches = {}  # 为每个虚拟层保存独立的 KV cache
+
+    def _load_layer_cache(self, layer_idx):
+        attn = self.transformer_block.attention
+        if layer_idx in self._layer_caches:
+            state = self._layer_caches[layer_idx]
+            attn.k_cache = state['k']
+            attn.v_cache = state['v']
+            attn.seq_len = state['seq_len']
+        else:
+            attn.k_cache = None
+            attn.v_cache = None
+            attn.seq_len = 0
+
+    def _save_layer_cache(self, layer_idx):
+        attn = self.transformer_block.attention
+        self._layer_caches[layer_idx] = {
+            'k': attn.k_cache,
+            'v': attn.v_cache,
+            'seq_len': attn.seq_len,
+        }
+
+    def reset_cache(self):
+        self._layer_caches.clear()
+
     def forward(self, input_ids): # input_ids 的形状为 [batch_size, seq_len]
         self.probe.reset() # 每次前向传播前重置 probe，清空上一次的观测数据
         x = self.embedding(input_ids) # 将输入的 token ids 转换为嵌入向量,形状为 [batch_size, seq_len, d_model]
-        for _ in range(self.num_blocks):
+        for i in range(self.num_blocks):
+            self._load_layer_cache(i)   # 换入第 i 个虚拟层的 cache
             x = self.transformer_block(x)
+            self._save_layer_cache(i)   # 换出保存
         self.captured_attention = list(self.probe.captured_data) # 显式copy一份数据，避免后续被修改
         logits = self.lm_head(x) # [batch_size, seq_len, vocab_size]
         return logits
+
+    def forward_hidden(self, input_ids):
+        """只返回 transformer 隐藏状态，不经过 lm_head（供分类头使用）"""
+        self.probe.reset()
+        x = self.embedding(input_ids)
+        for i in range(self.num_blocks):
+            self._load_layer_cache(i)
+            x = self.transformer_block(x)
+            self._save_layer_cache(i)
+        return x
+
+    def forward_from_embedding(self, x):
+        """直接接受 embedding 后的输入，跳过 token embedding（供非文本下游任务使用）"""
+        self.probe.reset()
+        for i in range(self.num_blocks):
+            self._load_layer_cache(i)
+            x = self.transformer_block(x)
+            self._save_layer_cache(i)
+        return x
+
+
+class TextClassifier(nn.Module):
+    """在预训练语言模型 backbone 上添加文本分类头（冻结 backbone）"""
+    def __init__(self, backbone, num_classes):
+        super().__init__()
+        self.backbone = backbone
+        # 冻结 backbone，只训练分类头
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        self.head = nn.Linear(backbone.d_model, num_classes)
+
+    def forward(self, input_ids):
+        with torch.no_grad():
+            x = self.backbone.forward_hidden(input_ids).detach()
+        # 用最后一个非 padding token 的隐藏状态做池化
+        # 因果模型中该位置 attended to 全部前文，天然是序列摘要
+        lengths = (input_ids != 0).sum(dim=1)  # [batch]
+        batch_idx = torch.arange(input_ids.shape[0], device=input_ids.device)
+        pooled = x[batch_idx, lengths - 1]  # [batch, d_model]
+        return self.head(pooled)
+
+
+class HandwrittenClassifier(nn.Module):
+    """手写图像分类器：将图像的每一行视为一个 token，通过 backbone transformer 提取特征"""
+    def __init__(self, backbone, patch_dim, num_classes):
+        super().__init__()
+        self.backbone = backbone
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        self.patch_embed = nn.Linear(patch_dim, backbone.d_model)
+        self.head = nn.Linear(backbone.d_model, num_classes)
+
+    def forward(self, images):
+        # images: [batch, seq_len, patch_dim] (e.g., [batch, 28, 28] for MNIST)
+        x = self.patch_embed(images)  # [batch, seq_len, d_model]
+        with torch.no_grad():
+            h = self.backbone.forward_from_embedding(x).detach()
+        # 用最后一行（因果模型中它看到了全部 28 行）
+        pooled = h[:, -1, :]  # [batch, d_model]
+        return self.head(pooled)
 
 

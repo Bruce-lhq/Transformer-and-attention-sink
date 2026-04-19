@@ -1,6 +1,8 @@
 from transformer_module import *
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 import matplotlib.pyplot as plt
 import seaborn as sns
 from torch.utils.tensorboard import SummaryWriter
@@ -164,12 +166,266 @@ class AttentionSinkExperiment:
     def generate(self, text_for_prompt, max_new_tokens=10):
         self.model.eval()
         with torch.no_grad():
+            self.model.reset_cache()  # 清空旧 cache，开始新的生成
             input_ids = self.tokenizer.encode(text_for_prompt).to(self.device)  # [1, seq_len]
-            for _ in range(max_new_tokens):
-                output_logits = self.model(input_ids)  # [1, seq_len, vocab_size]
-                next_token_logits = output_logits[:, -1, :]  # [1, vocab_size]
-                next_token_logits[:,0] = float('-inf')  # 禁止生成 padding token
-                next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)  # [1, 1]
-                input_ids = torch.cat((input_ids, next_token_id), dim=1)  # 将新预测的 token id 添加到输入序列末尾
-            generated_text = self.tokenizer.decode(input_ids.cpu())  # 解码成文本
+            # Prefill: 一次性处理完整 prompt
+            output_logits = self.model(input_ids)  # [1, seq_len, vocab_size]
+            next_token_logits = output_logits[:, -1, :]  # [1, vocab_size]
+            next_token_logits[:, 0] = float('-inf')  # 禁止生成 padding token
+            next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)  # [1, 1]
+            generated_tokens = [next_token_id]
+            # Decode: 每次只传入最新 token，利用 KV cache + sink tokens
+            for _ in range(max_new_tokens - 1):
+                output_logits = self.model(next_token_id)  # seq_len=1, 走 streaming 解码路径
+                next_token_logits = output_logits[:, -1, :]
+                next_token_logits[:, 0] = float('-inf')
+                next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
+                generated_tokens.append(next_token_id)
+            all_ids = torch.cat([input_ids] + generated_tokens, dim=1)
+            generated_text = self.tokenizer.decode(all_ids.cpu())
             return generated_text[0]
+
+    def evaluate_ppl(self, texts, batch_size=32):
+        """在给定文本上计算困惑度 (Perplexity)"""
+        self.model.eval()
+        self.model.reset_cache()
+        total_loss = 0.0
+        total_tokens = 0
+        with torch.no_grad():
+            all_ids = self.tokenizer.encode(texts).to(self.device)
+            for i in range(0, all_ids.shape[0], batch_size):
+                batch_ids = all_ids[i:i + batch_size]
+                input_ids = batch_ids[:, :-1]
+                target_ids = batch_ids[:, 1:]
+                logits = self.model(input_ids)
+                loss_per_token = F.cross_entropy(
+                    logits.reshape(-1, self.vocab_size),
+                    target_ids.reshape(-1),
+                    reduction='none'
+                )
+                mask = (target_ids != 0).reshape(-1)
+                total_loss += loss_per_token[mask].sum().item()
+                total_tokens += mask.sum().item()
+        avg_nll = total_loss / max(total_tokens, 1)
+        ppl = math.exp(avg_nll)
+        print(f"PPL: {ppl:.2f} (evaluated on {total_tokens} non-padding tokens)")
+        return ppl
+
+    def evaluate_cloze(self, texts, batch_size=32):
+        """评估字符级填空准确率：给定上文预测下一个字符"""
+        self.model.eval()
+        self.model.reset_cache()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            all_ids = self.tokenizer.encode(texts).to(self.device)
+            for i in range(0, all_ids.shape[0], batch_size):
+                batch_ids = all_ids[i:i + batch_size]
+                input_ids = batch_ids[:, :-1]
+                target_ids = batch_ids[:, 1:]
+                logits = self.model(input_ids)
+                mask = (target_ids != 0)
+                preds = logits.argmax(dim=-1)
+                correct += ((preds == target_ids) & mask).sum().item()
+                total += mask.sum().item()
+        accuracy = correct / max(total, 1)
+        print(f"Cloze Accuracy: {accuracy:.4f} ({correct}/{total} tokens)")
+        return accuracy
+
+    def train_text_classification(self, train_texts, train_labels, num_classes, val_texts=None, val_labels=None, epochs=10, batch_size=32, lr=1e-3, save_path=None):
+        """训练文本分类头（冻结 backbone），支持验证集监控，可选保存到 .pth"""
+        from sklearn.metrics import f1_score, accuracy_score
+
+        self.model.eval()
+        self.model.reset_cache()
+        classifier = TextClassifier(self.model, num_classes).to(self.device)
+        optimizer = torch.optim.Adam(classifier.head.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+
+        # 编码训练数据
+        train_ids = self.tokenizer.encode(train_texts).to(self.device)
+        train_labels_t = torch.tensor(train_labels, dtype=torch.long).to(self.device)
+
+        # 编码验证数据（如果提供）
+        val_ids = None
+        if val_texts is not None:
+            val_ids = self.tokenizer.encode(val_texts).to(self.device)
+
+        # 训练分类头
+        classifier.train()
+        best_val_f1 = 0.0
+        for epoch in range(epochs):
+            indices = torch.randperm(len(train_labels_t), device=self.device)
+            epoch_loss = 0.0
+            for i in range(0, len(indices), batch_size):
+                idx = indices[i:i + batch_size]
+                logits = classifier(train_ids[idx])
+                loss = criterion(logits, train_labels_t[idx])
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+            # 验证集评估
+            if val_ids is not None:
+                classifier.eval()
+                val_preds = []
+                with torch.no_grad():
+                    for i in range(0, len(val_ids), batch_size):
+                        logits = classifier(val_ids[i:i + batch_size])
+                        preds = torch.argmax(logits, dim=-1)
+                        val_preds.extend(preds.cpu().tolist())
+                val_f1 = f1_score(val_labels, val_preds, average='macro')
+                val_acc = accuracy_score(val_labels, val_preds)
+                print(f"  Epoch {epoch + 1}/{epochs}, train_loss: {epoch_loss:.4f}, val_f1: {val_f1:.4f}, val_acc: {val_acc:.4f}")
+                # 保存最佳模型
+                if save_path is not None and val_f1 > best_val_f1:
+                    best_val_f1 = val_f1
+                    torch.save({
+                        'head_state_dict': classifier.head.state_dict(),
+                        'num_classes': num_classes,
+                        'type': 'text',
+                    }, save_path)
+                    print(f"  Best model saved to {save_path} (val_f1: {val_f1:.4f})")
+                classifier.train()
+            else:
+                print(f"  Epoch {epoch + 1}/{epochs}, train_loss: {epoch_loss:.4f}")
+
+        # 如果没有验证集，在训练结束后保存最终模型
+        if save_path is not None and val_ids is None:
+            torch.save({
+                'head_state_dict': classifier.head.state_dict(),
+                'num_classes': num_classes,
+                'type': 'text',
+            }, save_path)
+            print(f"  Classification head saved to {save_path}")
+
+        return classifier
+
+    def eval_text_classification(self, test_texts, test_labels, num_classes, head_path=None, batch_size=32):
+        """加载分类头并在测试集上评估"""
+        from sklearn.metrics import f1_score, accuracy_score
+
+        self.model.eval()
+        self.model.reset_cache()
+
+        classifier = TextClassifier(self.model, num_classes).to(self.device)
+        if head_path is not None:
+            checkpoint = torch.load(head_path, map_location=self.device, weights_only=True)
+            classifier.head.load_state_dict(checkpoint['head_state_dict'])
+            print(f"Classification head loaded from {head_path}")
+
+        test_ids = self.tokenizer.encode(test_texts).to(self.device)
+
+        classifier.eval()
+        all_preds = []
+        with torch.no_grad():
+            for i in range(0, len(test_ids), batch_size):
+                logits = classifier(test_ids[i:i + batch_size])
+                preds = torch.argmax(logits, dim=-1)
+                all_preds.extend(preds.cpu().tolist())
+
+        f1 = f1_score(test_labels, all_preds, average='macro')
+        acc = accuracy_score(test_labels, all_preds)
+        print(f"Text Classification Results — F1 (macro): {f1:.4f}, Accuracy: {acc:.4f}")
+        return {'f1': f1, 'accuracy': acc, 'predictions': all_preds}
+
+    def train_handwritten_classification(self, train_images, train_labels, patch_dim, num_classes, val_images=None, val_labels=None, epochs=10, batch_size=32, lr=1e-3, save_path=None):
+        """训练手写图像分类头（冻结 backbone，训练 patch_embed + head）"""
+        from sklearn.metrics import f1_score, accuracy_score
+
+        self.model.eval()
+        self.model.reset_cache()
+        classifier = HandwrittenClassifier(self.model, patch_dim, num_classes).to(self.device)
+        optimizer = torch.optim.Adam(
+            list(classifier.patch_embed.parameters()) + list(classifier.head.parameters()),
+            lr=lr
+        )
+        criterion = nn.CrossEntropyLoss()
+
+        train_images = train_images.to(self.device)
+        train_labels_t = torch.tensor(train_labels, dtype=torch.long).to(self.device)
+
+        best_val_f1 = 0.0
+        history = {'train_loss': [], 'val_f1': [], 'val_acc': []}
+        for epoch in range(epochs):
+            indices = torch.randperm(len(train_labels_t), device=self.device)
+            epoch_loss = 0.0
+            for i in range(0, len(indices), batch_size):
+                idx = indices[i:i + batch_size]
+                logits = classifier(train_images[idx])
+                loss = criterion(logits, train_labels_t[idx])
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+            if val_images is not None:
+                classifier.eval()
+                val_images_dev = val_images.to(self.device)
+                val_preds = []
+                with torch.no_grad():
+                    for i in range(0, len(val_images_dev), batch_size):
+                        logits = classifier(val_images_dev[i:i + batch_size])
+                        preds = torch.argmax(logits, dim=-1)
+                        val_preds.extend(preds.cpu().tolist())
+                val_f1 = f1_score(val_labels, val_preds, average='macro')
+                val_acc = accuracy_score(val_labels, val_preds)
+                history['train_loss'].append(epoch_loss)
+                history['val_f1'].append(val_f1)
+                history['val_acc'].append(val_acc)
+                print(f"  Epoch {epoch + 1}/{epochs}, train_loss: {epoch_loss:.4f}, val_f1: {val_f1:.4f}, val_acc: {val_acc:.4f}")
+                if save_path is not None and val_f1 > best_val_f1:
+                    best_val_f1 = val_f1
+                    torch.save({
+                        'patch_embed_state_dict': classifier.patch_embed.state_dict(),
+                        'head_state_dict': classifier.head.state_dict(),
+                        'patch_dim': patch_dim,
+                        'num_classes': num_classes,
+                        'type': 'handwritten',
+                    }, save_path)
+                    print(f"  Best model saved to {save_path} (val_f1: {val_f1:.4f})")
+                classifier.train()
+            else:
+                print(f"  Epoch {epoch + 1}/{epochs}, train_loss: {epoch_loss:.4f}")
+
+        if save_path is not None and val_images is None:
+            torch.save({
+                'patch_embed_state_dict': classifier.patch_embed.state_dict(),
+                'head_state_dict': classifier.head.state_dict(),
+                'patch_dim': patch_dim,
+                'num_classes': num_classes,
+                'type': 'handwritten',
+            }, save_path)
+            print(f"  Handwritten classification head saved to {save_path}")
+
+        return classifier, history
+
+    def eval_handwritten_classification(self, test_images, test_labels, patch_dim, num_classes, head_path=None, batch_size=32):
+        """加载手写分类头并评估"""
+        from sklearn.metrics import f1_score, accuracy_score
+
+        self.model.eval()
+        self.model.reset_cache()
+
+        classifier = HandwrittenClassifier(self.model, patch_dim, num_classes).to(self.device)
+        if head_path is not None:
+            checkpoint = torch.load(head_path, map_location=self.device, weights_only=True)
+            classifier.patch_embed.load_state_dict(checkpoint['patch_embed_state_dict'])
+            classifier.head.load_state_dict(checkpoint['head_state_dict'])
+            print(f"Handwritten classification head loaded from {head_path}")
+
+        test_images = test_images.to(self.device)
+
+        classifier.eval()
+        all_preds = []
+        with torch.no_grad():
+            for i in range(0, len(test_images), batch_size):
+                logits = classifier(test_images[i:i + batch_size])
+                preds = torch.argmax(logits, dim=-1)
+                all_preds.extend(preds.cpu().tolist())
+
+        f1 = f1_score(test_labels, all_preds, average='macro')
+        acc = accuracy_score(test_labels, all_preds)
+        print(f"Handwritten Classification Results — F1 (macro): {f1:.4f}, Accuracy: {acc:.4f}")
+        return {'f1': f1, 'accuracy': acc, 'predictions': all_preds}
