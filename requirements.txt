@@ -1,1 +1,8 @@
-torch matplotlib seaborn
+torch
+numpy
+scipy
+matplotlib
+seaborn
+scikit-learn
+datasets
+pillow
